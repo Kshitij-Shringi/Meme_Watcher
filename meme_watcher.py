@@ -475,6 +475,260 @@ class DataAggregator:
                 seen_pairs[pair['pairAddress']] = pair
         return list(seen_pairs.values())
 
+class Position:
+    def __init__(self, token_address: str, symbol: str, entry_price: float, amount_usd: float = 10.0):
+        self.token_address = token_address
+        self.symbol = symbol
+        self.entry_price = entry_price
+        self.amount_usd = amount_usd
+        self.entry_time = time.time()
+        self.tokens = amount_usd / entry_price if entry_price > 0 else 0
+        self.exit_price = None
+        self.exit_time = None
+        self.profit_loss = 0
+        self.profit_loss_pct = 0
+        self.status = "OPEN"  # OPEN, CLOSED, STOP_LOSS
+        
+    def update(self, current_price: float) -> Tuple[bool, str]:
+        """Update position and check if we should exit"""
+        if self.status != "OPEN":
+            return False, ""
+            
+        # Calculate current P/L
+        current_value = self.tokens * current_price
+        self.profit_loss = current_value - self.amount_usd
+        self.profit_loss_pct = (current_value / self.amount_usd - 1) * 100
+        
+        # Exit signals
+        time_held = time.time() - self.entry_time
+        
+        # 1. Quick Scalp (< 5 minutes)
+        if time_held < 300:
+            if self.profit_loss_pct >= 50:  # Quick 50% gain
+                return True, "🎯 Quick scalp profit target hit (50%)"
+                
+        # 2. Short-term Hold (5-15 minutes)
+        elif time_held < 900:
+            if self.profit_loss_pct >= 30:  # 30% gain
+                return True, "💰 Short-term profit target hit (30%)"
+                
+        # 3. Medium-term Hold (15-30 minutes)
+        elif time_held < 1800:
+            if self.profit_loss_pct >= 20:  # 20% gain
+                return True, "💵 Medium-term profit target hit (20%)"
+                
+        # 4. Dynamic Stop Loss based on time held
+        stop_loss_pct = -15  # Base stop loss
+        if time_held > 900:  # After 15 minutes, tighten stop loss
+            stop_loss_pct = -10
+        if time_held > 1800:  # After 30 minutes, tighten more
+            stop_loss_pct = -7
+            
+        if self.profit_loss_pct <= stop_loss_pct:
+            return True, f"🛑 Stop loss hit ({stop_loss_pct}%)"
+            
+        # 5. Dynamic Trailing Stop based on profit level
+        if self.profit_loss_pct > 50:  # In massive profit
+            trailing_stop = current_price * 0.85  # 15% trailing stop
+            if trailing_stop < current_price:
+                return True, "🎢 Wide trailing stop hit (15%)"
+        elif self.profit_loss_pct > 30:  # In good profit
+            trailing_stop = current_price * 0.90  # 10% trailing stop
+            if trailing_stop < current_price:
+                return True, "🎢 Medium trailing stop hit (10%)"
+        elif self.profit_loss_pct > 15:  # In decent profit
+            trailing_stop = current_price * 0.95  # 5% trailing stop
+            if trailing_stop < current_price:
+                return True, "🎢 Tight trailing stop hit (5%)"
+                
+        # 6. Rapid Price Drop Protection
+        price_change_pct = ((current_price / self.entry_price) - 1) * 100
+        if price_change_pct < -10 and time_held < 300:  # 10% drop in first 5 minutes
+            return True, "⚡ Rapid price drop protection triggered"
+            
+        # 7. Time-based exit (Max hold time)
+        if time_held > 3600:  # 1 hour max hold
+            return True, "⏰ Max hold time reached (1 hour)"
+            
+        # 8. Profit Lock-in for longer holds
+        if time_held > 1800 and self.profit_loss_pct > 10:  # After 30 mins with >10% profit
+            return True, "🔒 Profit locked in after extended hold"
+            
+        return False, ""
+        
+    def close(self, exit_price: float, reason: str):
+        """Close the position"""
+        self.exit_price = exit_price
+        self.exit_time = time.time()
+        self.status = "CLOSED"
+        
+        # Calculate final P/L
+        final_value = self.tokens * exit_price
+        self.profit_loss = final_value - self.amount_usd
+        self.profit_loss_pct = (final_value / self.amount_usd - 1) * 100
+        
+        return self.format_exit_message(reason)
+        
+    def format_exit_message(self, reason: str) -> str:
+        """Format exit message for Discord"""
+        time_held = self.exit_time - self.entry_time
+        hours = int(time_held // 3600)
+        minutes = int((time_held % 3600) // 60)
+        seconds = int(time_held % 60)
+        
+        return (
+            f"🔄 EXIT SIGNAL: {self.symbol}\n"
+            f"💰 Entry: ${self.entry_price:.8f}\n"
+            f"💵 Exit: ${self.exit_price:.8f}\n"
+            f"⏱ Time Held: {hours}h {minutes}m {seconds}s\n"
+            f"📊 P/L: ${self.profit_loss:.2f} ({self.profit_loss_pct:+.2f}%)\n"
+            f"📝 Reason: {reason}\n"
+            f"🔗 Chart: https://dexscreener.com/solana/{self.token_address}"
+        )
+
+class Portfolio:
+    def __init__(self, initial_balance: float = 100.0, position_size: float = 10.0):
+        self.initial_balance = initial_balance
+        self.position_size = position_size
+        self.available_balance = initial_balance
+        self.total_value = initial_balance
+        self.active_positions = {}  # token_address -> Position
+        self.closed_positions = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.total_profit_loss = 0.0
+        self.peak_balance = initial_balance
+        self.last_update_time = time.time()
+        
+        # For simulated $10 positions
+        self.simulated_positions = {}  # token_address -> Position
+        self.simulated_closed_positions = []
+        self.simulated_total_trades = 0
+        self.simulated_winning_trades = 0
+        self.simulated_total_profit_loss = 0.0
+        
+    def can_open_position(self) -> bool:
+        """Check if we have enough balance to open a new position"""
+        return self.available_balance >= self.position_size
+        
+    def open_position(self, token_address: str, symbol: str, entry_price: float) -> Optional[Position]:
+        """Open a new position if we have enough balance"""
+        # Always open a simulated position
+        simulated_position = Position(token_address, symbol, entry_price, 10.0)  # Always $10
+        self.simulated_positions[token_address] = simulated_position
+        self.simulated_total_trades += 1
+        
+        # Only open a real position if we have enough balance
+        if not self.can_open_position():
+            return simulated_position
+            
+        position = Position(token_address, symbol, entry_price, self.position_size)
+        self.active_positions[token_address] = position
+        self.available_balance -= self.position_size
+        self.total_trades += 1
+        return position
+        
+    def close_position(self, token_address: str, exit_price: float, reason: str) -> Optional[Position]:
+        """Close a position and update portfolio stats"""
+        # Close simulated position if it exists
+        if token_address in self.simulated_positions:
+            sim_position = self.simulated_positions.pop(token_address)
+            sim_position.close(exit_price, reason)
+            self.simulated_closed_positions.append(sim_position)
+            self.simulated_total_profit_loss += sim_position.profit_loss
+            if sim_position.profit_loss > 0:
+                self.simulated_winning_trades += 1
+        
+        # Close real position if it exists
+        if token_address in self.active_positions:
+            position = self.active_positions.pop(token_address)
+            position.close(exit_price, reason)
+            self.closed_positions.append(position)
+            self.available_balance += position.amount_usd + position.profit_loss
+            self.total_profit_loss += position.profit_loss
+            
+            if position.profit_loss > 0:
+                self.winning_trades += 1
+            
+            # Update peak balance
+            self.total_value = self.available_balance + sum(
+                pos.tokens * pos.entry_price for pos in self.active_positions.values()
+            )
+            self.peak_balance = max(self.peak_balance, self.total_value)
+            
+            return position
+            
+        return None
+        
+    def get_portfolio_stats(self) -> Dict:
+        """Get current portfolio statistics"""
+        current_time = time.time()
+        time_running = current_time - self.last_update_time
+        
+        active_value = sum(
+            pos.tokens * pos.entry_price for pos in self.active_positions.values()
+        )
+        
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        roi = ((self.total_value / self.initial_balance) - 1) * 100
+        
+        # Calculate simulated stats
+        sim_win_rate = (self.simulated_winning_trades / self.simulated_total_trades * 100) if self.simulated_total_trades > 0 else 0
+        sim_active_value = sum(pos.tokens * pos.entry_price for pos in self.simulated_positions.values())
+        sim_total_value = sim_active_value + self.simulated_total_profit_loss
+        sim_roi = (self.simulated_total_profit_loss / (10.0 * self.simulated_total_trades) * 100) if self.simulated_total_trades > 0 else 0
+        
+        return {
+            "total_value": self.total_value,
+            "available_balance": self.available_balance,
+            "active_positions": len(self.active_positions),
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "win_rate": win_rate,
+            "total_profit_loss": self.total_profit_loss,
+            "roi": roi,
+            "peak_balance": self.peak_balance,
+            "time_running": time_running,
+            # Simulated stats ($10 per trade)
+            "sim_total_value": sim_total_value,
+            "sim_active_positions": len(self.simulated_positions),
+            "sim_total_trades": self.simulated_total_trades,
+            "sim_winning_trades": self.simulated_winning_trades,
+            "sim_win_rate": sim_win_rate,
+            "sim_total_profit_loss": self.simulated_total_profit_loss,
+            "sim_roi": sim_roi,
+            "sim_total_invested": 10.0 * self.simulated_total_trades
+        }
+        
+    def format_portfolio_message(self) -> str:
+        """Format portfolio stats for Discord message"""
+        stats = self.get_portfolio_stats()
+        
+        # Format time running
+        hours = int(stats["time_running"] // 3600)
+        minutes = int((stats["time_running"] % 3600) // 60)
+        
+        return f"""📊 **Portfolio Summary**
+
+💰 **Real Portfolio ($100 Initial)**
+• Total Value: ${stats['total_value']:.2f}
+• Available Balance: ${stats['available_balance']:.2f}
+• Total P/L: ${stats['total_profit_loss']:.2f} ({stats['roi']:.1f}%)
+• Peak Balance: ${stats['peak_balance']:.2f}
+• Active Positions: {stats['active_positions']}
+• Total Trades: {stats['total_trades']}
+• Win Rate: {stats['win_rate']:.1f}%
+
+🎮 **Simulated Portfolio ($10 per Trade)**
+• Total Value: ${stats['sim_total_value']:.2f}
+• Total P/L: ${stats['sim_total_profit_loss']:.2f} ({stats['sim_roi']:.1f}%)
+• Total Invested: ${stats['sim_total_invested']:.2f}
+• Active Positions: {stats['sim_active_positions']}
+• Total Trades: {stats['sim_total_trades']}
+• Win Rate: {stats['sim_win_rate']:.1f}%
+
+⏱️ Running Time: {hours}h {minutes}m"""
+
 class TradeOpportunityFinder:
     def __init__(self):
         self.discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
@@ -490,6 +744,10 @@ class TradeOpportunityFinder:
         self.api_rate_limit = 1.0
         self.alert_cooldown = {}
         self.alert_cooldown_period = 300
+        self.portfolio = Portfolio(
+            initial_balance=float(os.getenv('INITIAL_BALANCE', 100)),
+            position_size=float(os.getenv('POSITION_SIZE_USD', 10))
+        )
 
     async def _rate_limited_call(self, session: aiohttp.ClientSession, url: str, retries: int = 3) -> Optional[Dict]:
         """Make a rate-limited API call with retries and custom headers"""
@@ -620,8 +878,6 @@ class TradeOpportunityFinder:
                 txns_24h = pair.get('txns', {}).get('h24', {})
                 buys_1h = float(txns_1h.get('buys', 0))
                 sells_1h = float(txns_1h.get('sells', 0))
-                buys_24h = float(txns_24h.get('buys', 0))
-                sells_24h = float(txns_24h.get('sells', 0))
                 
             except (TypeError, ValueError) as e:
                 logger.error(f"Error parsing metrics: {e}")
@@ -784,7 +1040,8 @@ class TradeOpportunityFinder:
 • [DexScreener](https://dexscreener.com/solana/{pair.get('pairAddress')})
 • [Birdeye](https://birdeye.so/token/{address}?chain=solana)
 • [Trade on Raydium](https://raydium.io/swap/?inputCurrency=sol&outputCurrency={address})
-"""
+
+{self.portfolio.format_portfolio_message()}"""
             
             # Send to Discord
             webhook = DiscordWebhook(url=self.discord_webhook_url, content=message)
@@ -812,27 +1069,77 @@ class TradeOpportunityFinder:
                     await asyncio.sleep(60)
                     continue
                 
-                # Process each pair
+                # First update existing positions
+                await self.update_positions(pairs)
+                
+                # Send portfolio update every hour
+                current_time = time.time()
+                if current_time - self.portfolio.last_update_time >= 3600:  # 1 hour
+                    self.portfolio.last_update_time = current_time
+                    if self.discord_webhook_url:
+                        webhook = DiscordWebhook(
+                            url=self.discord_webhook_url,
+                            content=self.portfolio.format_portfolio_message()
+                        )
+                        await asyncio.to_thread(webhook.execute)
+                
+                # Then process new opportunities
                 for pair in pairs:
                     try:
                         # Extract token info
                         token = pair.get('baseToken', {})
+                        token_address = token.get('address')
                         symbol = token.get('symbol', 'Unknown')
+                        
+                        # Skip if we already have a simulated position
+                        if token_address in self.portfolio.simulated_positions:
+                            continue
+                        
                         price = float(pair.get('priceUsd', '0'))
                         liquidity = float(pair.get('liquidity', {}).get('usd', '0'))
+                        volume_24h = float(pair.get('volume', {}).get('h24', '0'))
+                        
+                        # Get price changes
+                        changes = pair.get('priceChange', {})
+                        m5 = float(changes.get('m5', '0'))
+                        m15 = float(changes.get('m15', '0'))
+                        h1 = float(changes.get('h1', '0'))
+                        h24 = float(changes.get('h24', '0'))
+                        
+                        # Get analysis data
                         analysis = pair.get('_analysis', {})
+                        pump_score = float(analysis.get('pump_score', 0))
                         
-                        # Format message
-                        message = (
-                            f"🚨 Potential Pump Alert: {symbol}\n"
-                            f"💰 Price: ${price:.8f}\n"
-                            f"💧 Liquidity: ${liquidity:,.0f}\n"
-                            f"📈 1h Change: {pair.get('priceChange', {}).get('h1', 0):+.2f}%\n"
-                            f"⭐ Score: {analysis.get('pump_score', 0):.2f}\n"
-                            f"🔗 Chart: https://dexscreener.com/solana/{pair.get('pairAddress')}"
-                        )
+                        # Open simulated position
+                        position = self.portfolio.open_position(token_address, symbol, price)
                         
-                        # Send alert
+                        # Format entry message
+                        message = f"""🎯 **New Trade Alert: {symbol}**
+
+💰 **Entry Details**
+• Price: ${price:.8f}
+• Position Size: $10.00
+• Tokens: {10.0/price:.2f}
+
+📈 **Price Action**
+• 5m: {m5:+.1f}%
+• 15m: {m15:+.1f}%
+• 1h: {h1:+.1f}%
+• 24h: {h24:+.1f}%
+
+📊 **Market Stats**
+• Liquidity: ${liquidity:,.0f}
+• 24h Volume: ${volume_24h:,.0f}
+• Score: {pump_score:.2f}/1.0
+
+🔗 **Quick Links**
+• [DexScreener](https://dexscreener.com/solana/{pair.get('pairAddress')})
+• [Birdeye](https://birdeye.so/token/{token_address}?chain=solana)
+• [Trade on Raydium](https://raydium.io/swap/?inputCurrency=sol&outputCurrency={token_address})
+
+{self.portfolio.format_portfolio_message()}"""
+                        
+                        # Send to Discord
                         if self.discord_webhook_url:
                             webhook = DiscordWebhook(
                                 url=self.discord_webhook_url,
@@ -853,6 +1160,58 @@ class TradeOpportunityFinder:
             except Exception as e:
                 console_logger.error(f"❌ Error: {str(e)}")
                 await asyncio.sleep(60)
+
+    async def update_positions(self, current_pairs: List[Dict]):
+        """Update all active positions and check for exits"""
+        # Create price lookup
+        price_lookup = {
+            pair.get('pairAddress'): float(pair.get('priceUsd', '0'))
+            for pair in current_pairs
+        }
+        
+        # Update each position
+        positions_to_remove = []
+        
+        for token_address, position in self.portfolio.active_positions.items():
+            try:
+                current_price = price_lookup.get(token_address)
+                if not current_price:
+                    continue
+                    
+                # Check for exit signal
+                should_exit, reason = position.update(current_price)
+                
+                if should_exit:
+                    # Format exit message
+                    exit_message = position.format_exit_message(reason)
+                    
+                    # Close position and update portfolio
+                    closed_position = self.portfolio.close_position(token_address, current_price, reason)
+                    
+                    # Add portfolio summary to exit message
+                    exit_message = f"{exit_message}\n\n{self.portfolio.format_portfolio_message()}"
+                    
+                    # Send to Discord
+                    if self.discord_webhook_url:
+                        webhook = DiscordWebhook(
+                            url=self.discord_webhook_url,
+                            content=exit_message
+                        )
+                        await asyncio.to_thread(webhook.execute)
+                    
+                    # Print to console
+                    console_logger.info("\n" + exit_message + "\n")
+                    
+                    positions_to_remove.append(token_address)
+                    
+            except Exception as e:
+                console_logger.error(f"Error updating position {position.symbol}: {str(e)}")
+                continue
+                
+        # Remove closed positions
+        for token_address in positions_to_remove:
+            if token_address in self.portfolio.active_positions:
+                del self.portfolio.active_positions[token_address]
 
     async def start(self):
         """Start the opportunity finder"""
@@ -999,7 +1358,7 @@ class TradeOpportunityFinder:
         async with aiohttp.ClientSession() as session:
             # Focus on search queries that work well
             search_strategies = [
-                # Meme token searches
+                # Classic Meme Token Patterns
                 "https://api.dexscreener.com/latest/dex/search?q=baby+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=mini+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=moon+sol",
@@ -1007,13 +1366,62 @@ class TradeOpportunityFinder:
                 "https://api.dexscreener.com/latest/dex/search?q=inu+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=pepe+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=doge+sol",
-                # Additional searches for more coverage
+                
+                # Additional Meme Keywords
                 "https://api.dexscreener.com/latest/dex/search?q=shit+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=chad+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=wojak+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=meme+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=ai+sol",
                 "https://api.dexscreener.com/latest/dex/search?q=gpt+sol",
+                
+                # New Trending Keywords
+                "https://api.dexscreener.com/latest/dex/search?q=based+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=bonk+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=wojak+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=pepo+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=cope+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=frog+sol",
+                
+                # Animal-themed
+                "https://api.dexscreener.com/latest/dex/search?q=cat+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=dog+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=ape+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=monkey+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=bird+sol",
+                
+                # Popular Culture
+                "https://api.dexscreener.com/latest/dex/search?q=trump+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=biden+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=x+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=meta+sol",
+                
+                # Crypto Slang
+                "https://api.dexscreener.com/latest/dex/search?q=fomo+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=hodl+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=pump+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=wagmi+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=ngmi+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=lfg+sol",
+                
+                # Token Variations
+                "https://api.dexscreener.com/latest/dex/search?q=safe+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=fair+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=rocket+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=lambo+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=gem+sol",
+                
+                # Prefix/Suffix Patterns
+                "https://api.dexscreener.com/latest/dex/search?q=sol+2.0",
+                "https://api.dexscreener.com/latest/dex/search?q=sol+v2",
+                "https://api.dexscreener.com/latest/dex/search?q=sol+pro",
+                "https://api.dexscreener.com/latest/dex/search?q=sol+ai",
+                
+                # Seasonal/Trending
+                "https://api.dexscreener.com/latest/dex/search?q=christmas+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=santa+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=new+year+sol",
+                "https://api.dexscreener.com/latest/dex/search?q=valentine+sol",
             ]
             
             all_pairs = []
@@ -1253,7 +1661,7 @@ class TradeOpportunityFinder:
             if buys + sells < 3:  # Too inactive
                 return False, 0.0, "Too inactive"
                 
-            if liquidity < 500 or liquidity > 30000:  # Liquidity outside range
+            if liquidity < 500 or liquidity > 50000:  # Liquidity outside range
                 return False, 0.0, "Invalid liquidity"
             
             # Initialize score components
